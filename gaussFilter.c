@@ -3,16 +3,19 @@
 // Author: Lixiaolong@xa.com
 // Date: 2022/6/30
 //
-#include <strings.h>
+
+#include <printf.h>
 #include "stdlib.h"
 #include "math.h"
 #include "gaussFilter.h"
 #include "arm_neon.h"
+#include "string.h"
 
 #define MAX_KERNEL_SIZE   79
 #define XA_U8_SIZE        16
 #define XA_F32_SIZE       4
 #define PI 3.14159
+#define NORM_SHIFT        8
 
 
 static void getGaussianKernel1D(float *kernel, int ksize, float sigma);
@@ -21,9 +24,11 @@ static void getGaussianKernel2D(float *kernel, int ksize, float sigma);
 
 static void generateGaussianKernel(float **kernel, int ksize, float sigma);
 
-static void verticalFilterNeonU8(U8* src, U8* dst, int height, int width, int channel, float* kernel, int ksize);
+static unsigned int getGaussianInt(uint16_t *kernel, int ksize);
 
-static void horizonFilterNeonU8(U8* src, U8* dst, int height, int width, int channel, float* kernel, int ksize);
+static void verticalFilterNeonU8(U8* src, U8* dst, int height, int width, int channel, uint16_t* kernel, int ksize);
+
+static void horizonFilterNeonU8(U8* src, U8* dst, int height, int width, int channel, uint16_t* kernel, int ksize);
 
 static void verticalFilterNeonF32(float* src, float* dst, int height, int width, int channel, float* kernel, int ksize);
 
@@ -105,16 +110,41 @@ static void generateGaussianKernel(float **kernel, int ksize, float sigma)
     }
 }
 
-static void verticalFilterNeonU8(U8* src, U8* dst, int height, int width, int channel, float* kernel, int ksize)
+static unsigned int getGaussianInt(uint16_t *kernel, int ksize)
+{
+    if(kernel == NULL){
+        return 0;
+    }
+    int s = 0;
+
+    for(int i = 0; i < ksize / 2 + 1; i++){
+        kernel[i] = 2 * (i + 1) - 1;
+        s += kernel[i];
+    }
+    for(int i = ksize / 2 + 1; i < ksize; i++){
+        kernel[i] = kernel[ksize - i - 1];
+        s += kernel[i];
+    }
+    return s;
+}
+
+static void verticalFilterNeonU8(U8* src, U8* dst, int height, int width, int channel, uint16_t* kernel, int ksize)
 {
     int kCenter = ksize / 2;
 
     unsigned char* in = (unsigned char*) calloc(sizeof(unsigned char), width * (height + ksize) * channel);
+    memcpy(in, src, kCenter * width * channel);
     memcpy(in + kCenter * width * channel, src, height * width * channel);
+    memcpy(in + (kCenter + height) * width * channel, in + height * width * channel, kCenter * width * channel);
 
     if(channel == 1){
         for(int i = 0; i < height; i++){
-            for(int j = 0; j < width; j += XA_U8_SIZE){
+            unsigned char*p_dst = dst + i * width * channel;
+            int n = width / XA_U8_SIZE;
+            int end = n * (XA_U8_SIZE * channel);
+            int count = 0;
+
+            for(int j = 0; j < end; j += XA_U8_SIZE){
                 uint16x8_t laccum_u16, haccum_u16;
                 laccum_u16 = vmovq_n_u16(0);
                 haccum_u16 = vmovq_n_u16(0);
@@ -127,22 +157,40 @@ static void verticalFilterNeonU8(U8* src, U8* dst, int height, int width, int ch
                     uint16x8_t lp_u16 = vmovl_u8( lp_u8 );
                     uint16x8_t hp_u16 = vmovl_u8( hp_u8 );
 
-                    float16x8_t w = vdupq_n_f16(kernel[k]);
-
-                    laccum_u16 = vaddq_u16(laccum_u16, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(lp_u16), w)));
-                    haccum_u16 = vaddq_u16(haccum_u16, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(hp_u16), w)));
+                    laccum_u16 = vmlaq_n_u16(laccum_u16, lp_u16, kernel[k]);
+                    haccum_u16 = vmlaq_n_u16(haccum_u16, hp_u16, kernel[k]);
                 }
-
+                laccum_u16 = vshrq_n_u16(laccum_u16, NORM_SHIFT);
+                haccum_u16 = vshrq_n_u16(haccum_u16, NORM_SHIFT);
                 uint8x8_t laccum_u8 = vmovn_u16( laccum_u16 );
                 uint8x8_t haccum_u8 = vmovn_u16( haccum_u16 );
                 uint8x16_t accum_u8 = vcombine_u8( laccum_u8, haccum_u8 );
-                vst1q_u8(dst, accum_u8);
-                dst += XA_U8_SIZE;
+                vst1q_u8(p_dst + j, accum_u8);
+                count += 16;
+            }
+
+            for(int j = count; j < width; j++){
+                U8 s = 0;
+                for(int k = 0; k < ksize; k++){
+                    s += (in[(i + k) * width * channel + j * channel] * kernel[k]) >> NORM_SHIFT;
+                }
+                if(s < 0)
+                    s = 0;
+                if(s > 255)
+                    s = 255;
+                p_dst[j * channel] = (U8)s;
             }
         }
-    } else if(channel == 3){
+    }
+    else if(channel == 3)
+    {
         for(int i = 0; i < height; i++){
-            for(int j = 0; j < width * channel; j+= XA_U8_SIZE * channel){
+            int n = width / XA_U8_SIZE;
+            int end = n * (XA_U8_SIZE * channel);
+            unsigned char*p_dst = dst + i * width * channel;
+            int count = 0;
+
+            for(int j = 0; j < end; j+= XA_U8_SIZE * channel){
                 uint16x8_t laccum_u16_r = vmovq_n_u16(0);
                 uint16x8_t haccum_u16_r = vmovq_n_u16(0);
 
@@ -160,8 +208,6 @@ static void verticalFilterNeonU8(U8* src, U8* dst, int height, int width, int ch
                 for(int k = 0; k < ksize; k++){
                     uint8x16x3_t data = vld3q_u8(in + (i + k) * width * channel + j);
 
-                    float16x8_t w = vdupq_n_f16(kernel[k]);
-
                     // r
                     lp_u8 = vget_low_u8( data.val[0]);
                     hp_u8 = vget_high_u8( data.val[0]);
@@ -169,8 +215,8 @@ static void verticalFilterNeonU8(U8* src, U8* dst, int height, int width, int ch
                     lp_u16 = vmovl_u8( lp_u8 );
                     hp_u16 = vmovl_u8( hp_u8 );
 
-                    laccum_u16_r = vaddq_u16(laccum_u16_r, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(lp_u16), w)));
-                    haccum_u16_r = vaddq_u16(haccum_u16_r, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(hp_u16), w)));
+                    laccum_u16_r = vmlaq_n_u16(laccum_u16_r, lp_u16, kernel[k]);
+                    haccum_u16_r = vmlaq_n_u16(haccum_u16_r, hp_u16, kernel[k]);
 
                     // g
                     lp_u8 = vget_low_u8( data.val[1]);
@@ -179,8 +225,8 @@ static void verticalFilterNeonU8(U8* src, U8* dst, int height, int width, int ch
                     lp_u16 = vmovl_u8( lp_u8 );
                     hp_u16 = vmovl_u8( hp_u8 );
 
-                    laccum_u16_g = vaddq_u16(laccum_u16_g, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(lp_u16), w)));
-                    haccum_u16_g = vaddq_u16(haccum_u16_g, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(hp_u16), w)));
+                    laccum_u16_g = vmlaq_n_u16(laccum_u16_g, lp_u16, kernel[k]);
+                    haccum_u16_g = vmlaq_n_u16(haccum_u16_g, hp_u16, kernel[k]);
 
                     // b
                     lp_u8 = vget_low_u8( data.val[2]);
@@ -189,17 +235,24 @@ static void verticalFilterNeonU8(U8* src, U8* dst, int height, int width, int ch
                     lp_u16 = vmovl_u8( lp_u8 );
                     hp_u16 = vmovl_u8( hp_u8 );
 
-                    laccum_u16_b = vaddq_u16(laccum_u16_b, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(lp_u16), w)));
-                    haccum_u16_b = vaddq_u16(haccum_u16_b, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(hp_u16), w)));
+                    laccum_u16_b = vmlaq_n_u16(laccum_u16_b, lp_u16, kernel[k]);
+                    haccum_u16_b = vmlaq_n_u16(haccum_u16_b, hp_u16, kernel[k]);
                 }
+
+                laccum_u16_r = vshrq_n_u16(laccum_u16_r, NORM_SHIFT);
+                haccum_u16_r = vshrq_n_u16(haccum_u16_r, NORM_SHIFT);
                 uint8x8_t laccum_u8_r = vmovn_u16( laccum_u16_r );
                 uint8x8_t haccum_u8_r = vmovn_u16( haccum_u16_r );
                 uint8x16_t accum_u8_r = vcombine_u8( laccum_u8_r, haccum_u8_r);
 
+                laccum_u16_g = vshrq_n_u16(laccum_u16_g, NORM_SHIFT);
+                haccum_u16_g = vshrq_n_u16(haccum_u16_g, NORM_SHIFT);
                 uint8x8_t laccum_u8_g = vmovn_u16( laccum_u16_g );
                 uint8x8_t haccum_u8_g = vmovn_u16( haccum_u16_g );
                 uint8x16_t accum_u8_g = vcombine_u8( laccum_u8_g, haccum_u8_g);
 
+                laccum_u16_b = vshrq_n_u16(laccum_u16_b, NORM_SHIFT);
+                haccum_u16_b = vshrq_n_u16(haccum_u16_b, NORM_SHIFT);
                 uint8x8_t laccum_u8_b = vmovn_u16( laccum_u16_b );
                 uint8x8_t haccum_u8_b = vmovn_u16( haccum_u16_b );
                 uint8x16_t accum_u8_b = vcombine_u8( laccum_u8_b, haccum_u8_b);
@@ -209,8 +262,30 @@ static void verticalFilterNeonU8(U8* src, U8* dst, int height, int width, int ch
                 res.val[1] = accum_u8_g;
                 res.val[2] = accum_u8_b;
 
-                vst3q_u8(dst, res);
-                dst += XA_U8_SIZE * channel;
+                vst3q_u8(p_dst + j, res);
+
+                count += 48;
+            }
+            // 处理剩余部分
+            for (int j = count / 3; j < width; j++) {
+                U8 s[3] = {0};
+                for (int k = 0; k < ksize; k++) {
+                    s[0] += (in[(i + k) * width * channel + j * channel + 0] * kernel[k]) >> NORM_SHIFT;
+                    s[1] += (in[(i + k) * width * channel + j * channel + 1] * kernel[k]) >> NORM_SHIFT;
+                    s[2] += (in[(i + k) * width * channel + j * channel + 2] * kernel[k]) >> NORM_SHIFT;
+                }
+                for (int m = 0; m < channel; m++) {
+                    if (s[m] < 0) {
+                        s[m] = 0;
+                    }
+                    if (s[m] > 255) {
+                        s[m] = 255;
+                    }
+                }
+
+                p_dst[j * channel + 0] = (U8) s[0];
+                p_dst[j * channel + 1] = (U8) s[1];
+                p_dst[j * channel + 2] = (U8) s[2];
             }
         }
     } else{
@@ -220,18 +295,23 @@ static void verticalFilterNeonU8(U8* src, U8* dst, int height, int width, int ch
     free(in);
 }
 
-static void horizonFilterNeonU8(U8* src, U8* dst, int height, int width, int channel, float* kernel, int ksize)
+static void horizonFilterNeonU8(U8* src, U8* dst, int height, int width, int channel, uint16_t* kernel, int ksize)
 {
     int kCenter = ksize / 2;
+
     if (channel == 1){
         for(int i = 0; i < height; i++){
-            unsigned char* in = (unsigned char*) calloc((width + ksize), sizeof(unsigned char));
-            memcpy(in + kCenter, src + i * width, width);
+            U8* in = (U8*) calloc((width + ksize), sizeof(U8));
+            memcpy(in, src + i * width * channel, kCenter * channel);
+            memcpy(in + kCenter * channel, src + i * width * channel, width * channel);
+            memcpy(in + (kCenter + width) * channel, in + width * channel, kCenter * channel);
 
             unsigned char* p_dst = dst + i * width;
+            int n = width / XA_U8_SIZE;
+            int end = n * (XA_U8_SIZE * channel);
+            int count = 0;
 
-            for(int j = 0; j < width; j+=XA_U8_SIZE){
-
+            for(int j = 0; j < end; j+=XA_U8_SIZE){
                 uint16x8_t laccum_u16, haccum_u16;
                 laccum_u16 = vmovq_n_u16(0);
                 haccum_u16 = vmovq_n_u16(0);
@@ -244,29 +324,48 @@ static void horizonFilterNeonU8(U8* src, U8* dst, int height, int width, int cha
                     uint16x8_t lp_u16 = vmovl_u8( lp_u8 );
                     uint16x8_t hp_u16 = vmovl_u8( hp_u8 );
 
-                    float16x8_t w = vdupq_n_f16(kernel[k]);
-
-                    laccum_u16 = vaddq_u16(laccum_u16, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(lp_u16), w)));
-                    haccum_u16 = vaddq_u16(haccum_u16, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(hp_u16), w)));
-
+                    laccum_u16 = vmlaq_n_u16(laccum_u16, lp_u16, kernel[k]);
+                    haccum_u16 = vmlaq_n_u16(haccum_u16, hp_u16, kernel[k]);
                 }
+                laccum_u16 = vshrq_n_u16(laccum_u16, NORM_SHIFT);
+                haccum_u16 = vshrq_n_u16(haccum_u16, NORM_SHIFT);
                 uint8x8_t laccum_u8 = vmovn_u16( laccum_u16 );
                 uint8x8_t haccum_u8 = vmovn_u16( haccum_u16 );
                 uint8x16_t accum_u8 = vcombine_u8( laccum_u8, haccum_u8 );
-                vst1q_u8(p_dst, accum_u8);
-                p_dst += XA_U8_SIZE;
+                vst1q_u8(p_dst + j, accum_u8);
+                count += XA_U8_SIZE;
+            }
+
+            for(int j = count / channel; j < width; j++){
+                U8 s = 0;
+                for(int k = 0; k < ksize; k++){
+                    s += (*(in + (j + k) * channel) * kernel[k]) >> NORM_SHIFT;
+                }
+                if(s < 0)
+                    s = 0;
+                if(s > 255)
+                    s = 255;
+
+                p_dst[j * channel] = (U8)s;
             }
 
             free(in);
         }
-    } else if(channel == 3){
+    }
+    else if(channel == 3)
+    {
         for(int i = 0; i < height; i++){
             U8* in = (U8*) calloc((width + ksize) * channel, sizeof(U8));
+            memcpy(in, src + i * width * channel, kCenter * channel);
             memcpy(in + kCenter * channel, src + i * width * channel, width * channel);
+            memcpy(in + (kCenter + width) * channel, in + width * channel, kCenter * channel);
 
             U8* p_dst = dst + i * width * channel;
+            int n = width / XA_U8_SIZE;
+            int end = n * (XA_U8_SIZE * channel);
+            int count = 0;
 
-            for(int j = 0; j < width * channel; j += XA_U8_SIZE * channel){
+            for(int j = 0; j < end; j += XA_U8_SIZE * channel){
                 uint16x8_t laccum_u16_r = vmovq_n_u16(0);
                 uint16x8_t haccum_u16_r = vmovq_n_u16(0);
 
@@ -284,7 +383,6 @@ static void horizonFilterNeonU8(U8* src, U8* dst, int height, int width, int cha
                 for(int k = 0; k < ksize; k++){
                     uint8x16x3_t data = vld3q_u8(in + j + k * channel);
 
-                    float16x8_t w = vdupq_n_f16(kernel[k]);
                     // r
                     lp_u8 = vget_low_u8( data.val[0]);
                     hp_u8 = vget_high_u8( data.val[0]);
@@ -292,8 +390,8 @@ static void horizonFilterNeonU8(U8* src, U8* dst, int height, int width, int cha
                     lp_u16 = vmovl_u8( lp_u8 );
                     hp_u16 = vmovl_u8( hp_u8 );
 
-                    laccum_u16_r = vaddq_u16(laccum_u16_r, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(lp_u16), w)));
-                    haccum_u16_r = vaddq_u16(haccum_u16_r, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(hp_u16), w)));
+                    laccum_u16_r = vmlaq_n_u16(laccum_u16_r, lp_u16, kernel[k]);
+                    haccum_u16_r = vmlaq_n_u16(haccum_u16_r, hp_u16, kernel[k]);
 
                     // g
                     lp_u8 = vget_low_u8( data.val[1]);
@@ -302,8 +400,8 @@ static void horizonFilterNeonU8(U8* src, U8* dst, int height, int width, int cha
                     lp_u16 = vmovl_u8( lp_u8 );
                     hp_u16 = vmovl_u8( hp_u8 );
 
-                    laccum_u16_g = vaddq_u16(laccum_u16_g, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(lp_u16), w)));
-                    haccum_u16_g = vaddq_u16(haccum_u16_g, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(hp_u16), w)));
+                    laccum_u16_g = vmlaq_n_u16(laccum_u16_g, lp_u16, kernel[k]);
+                    haccum_u16_g = vmlaq_n_u16(haccum_u16_g, hp_u16, kernel[k]);
 
                     // b
                     lp_u8 = vget_low_u8( data.val[2]);
@@ -312,18 +410,24 @@ static void horizonFilterNeonU8(U8* src, U8* dst, int height, int width, int cha
                     lp_u16 = vmovl_u8( lp_u8 );
                     hp_u16 = vmovl_u8( hp_u8 );
 
-                    laccum_u16_b = vaddq_u16(laccum_u16_b, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(lp_u16), w)));
-                    haccum_u16_b = vaddq_u16(haccum_u16_b, vcvtq_u16_f16(vmulq_f16(vcvtq_f16_u16(hp_u16), w)));
+                    laccum_u16_b = vmlaq_n_u16(laccum_u16_b, lp_u16, kernel[k]);
+                    haccum_u16_b = vmlaq_n_u16(haccum_u16_b, hp_u16, kernel[k]);
                 }
 
+                laccum_u16_r = vshrq_n_u16(laccum_u16_r, NORM_SHIFT);
+                haccum_u16_r = vshrq_n_u16(haccum_u16_r, NORM_SHIFT);
                 uint8x8_t laccum_u8_r = vmovn_u16( laccum_u16_r );
                 uint8x8_t haccum_u8_r = vmovn_u16( haccum_u16_r );
                 uint8x16_t accum_u8_r = vcombine_u8( laccum_u8_r, haccum_u8_r);
 
+                laccum_u16_g = vshrq_n_u16(laccum_u16_g, NORM_SHIFT);
+                haccum_u16_g = vshrq_n_u16(haccum_u16_g, NORM_SHIFT);
                 uint8x8_t laccum_u8_g = vmovn_u16( laccum_u16_g );
                 uint8x8_t haccum_u8_g = vmovn_u16( haccum_u16_g );
                 uint8x16_t accum_u8_g = vcombine_u8( laccum_u8_g, haccum_u8_g);
 
+                laccum_u16_b = vshrq_n_u16(laccum_u16_b, NORM_SHIFT);
+                haccum_u16_b = vshrq_n_u16(haccum_u16_b, NORM_SHIFT);
                 uint8x8_t laccum_u8_b = vmovn_u16( laccum_u16_b );
                 uint8x8_t haccum_u8_b = vmovn_u16( haccum_u16_b );
                 uint8x16_t accum_u8_b = vcombine_u8( laccum_u8_b, haccum_u8_b);
@@ -333,8 +437,29 @@ static void horizonFilterNeonU8(U8* src, U8* dst, int height, int width, int cha
                 res.val[1] = accum_u8_g;
                 res.val[2] = accum_u8_b;
 
-                vst3q_u8(p_dst, res);
-                p_dst += XA_U8_SIZE * channel;
+                vst3q_u8(p_dst + j, res);
+                count += 48;
+            }
+            // 处理剩余部分
+            for (int j = count / 3; j < width; j++) {
+                int s[3] = {0};
+                for (int k = 0; k < ksize; k++) {
+                    s[0] += (*(in + (j + k) * channel + 0) * kernel[k]) >> NORM_SHIFT;
+                    s[1] += (*(in + (j + k) * channel + 1) * kernel[k]) >> NORM_SHIFT;
+                    s[2] += (*(in + (j + k) * channel + 2) * kernel[k]) >> NORM_SHIFT;
+                }
+                for (int m = 0; m < channel; m++) {
+                    if (s[m] < 0) {
+                        s[m] = 0;
+                    }
+                    if (s[m] > 255) {
+                        s[m] = 255;
+                    }
+                }
+
+                p_dst[j * channel + 0] = (U8) s[0];
+                p_dst[j * channel + 1] = (U8) s[1];
+                p_dst[j * channel + 2] = (U8) s[2];
             }
 
             free(in);
@@ -350,15 +475,19 @@ void gaussianFilter_u8_Neon(U8* src, U8* dst, int height, int width, int channel
         return;
     }
 #if 1
-    float *kernel = (float *) malloc(sizeof(float) * ksize);
-    getGaussianKernel1D(kernel, ksize, sigma);
 
-    U8* temp = (U8*) malloc(sizeof(U8) * height * width * channel);
-    verticalFilterNeonU8(src, temp, height, width, channel, kernel, ksize);
-    horizonFilterNeonU8(temp, dst, height, width, channel, kernel, ksize);
+    uint16_t *weight = (uint16_t*) malloc(sizeof(uint16_t) * ksize);
+    uint16_t sum = getGaussianInt(weight, ksize);
+    float weightsNorm = (float)(1 << NORM_SHIFT);
+    float iwsum = weightsNorm / (float)sum;
+    for(int i = 0; i < ksize; i++){
+        weight[i] = (uint16_t)((float)weight[i] * iwsum + 0.5);
+    }
 
-    free(kernel);
-    free(temp);
+    verticalFilterNeonU8(src, dst, height, width, channel, weight, ksize);
+    horizonFilterNeonU8(dst, dst, height, width, channel, weight, ksize);
+
+    free(weight);
 #endif
 }
 
@@ -501,32 +630,51 @@ static void verticalFilterNeonF32(float* src, float* dst, int height, int width,
 {
     int kCenter = ksize / 2;
 
-    float* in = (float*) calloc(sizeof(float), width * (height + ksize) * channel);
+    float* in = (float*) malloc(sizeof(float) * width * (height + ksize) * channel);
     memcpy(in, src, kCenter * width * channel * sizeof(float));
     memcpy(in + kCenter * width * channel, src, height * width * channel * sizeof(float));
     memcpy(in + (kCenter + height) * width * channel, in + height * width * channel, kCenter * width * channel * sizeof(float));
 
     if(channel == 1){
         for(int i = 0; i < height; i++){
-            for(int j = 0; j < width; j += 4){
+            float* p_dst = dst + i * width * channel;
+            int n = width / XA_F32_SIZE;
+            int end = n * (XA_F32_SIZE * channel);
+            int count = 0;
+
+            for(int j = 0; j < end; j += XA_F32_SIZE){
                 float32x4_t accum_f32;
                 accum_f32 = vmovq_n_f32(0);
 
                 for(int k = 0; k < ksize; k++){
-                    float32x4_t data = vld1q_f32(in + (i + k) * width + j);
+                    float32x4_t data = vld1q_f32(in + (i + k) * width * channel + j);
 
                     float32x4_t w = vdupq_n_f32(kernel[k]);
 
                     accum_f32 = vaddq_f32(accum_f32, vmulq_f32(data, w));
                 }
 
-                vst1q_f32(dst, accum_f32);
-                dst += 4;
+                vst1q_f32(p_dst + j, accum_f32);
+                count += XA_F32_SIZE;
+            }
+
+            for(int j = count; j < width; j++){
+                float s = 0;
+                for(int k = 0; k < ksize; k++){
+                    s += in[(i + k) * width * channel + j * channel] * kernel[k];
+                }
+
+                p_dst[j * channel] = s;
             }
         }
     }else if(channel == 3){
         for(int i = 0; i < height; i++){
-            for(int j = 0; j < width * channel; j+=12){
+            int n = width / XA_F32_SIZE;
+            int end = n * XA_F32_SIZE * channel;
+            float *p_dst = dst + i * width * channel;
+            int count = 0;
+
+            for(int j = 0; j < end; j+=XA_F32_SIZE * channel){
                 float32x4_t accum_f32_r, accum_f32_g, accum_f32_b;
                 accum_f32_r = vmovq_n_f32(0);
                 accum_f32_g = vmovq_n_f32(0);
@@ -535,14 +683,12 @@ static void verticalFilterNeonF32(float* src, float* dst, int height, int width,
                 for(int k = 0; k < ksize; k++){
                     float32x4x3_t data = vld3q_f32(in + (i + k) * width * channel + j);
 
-                    float32x4_t w = vdupq_n_f32(kernel[k]);
-
                     // r
-                    accum_f32_r = vaddq_f32(accum_f32_r, vmulq_f32(data.val[0], w));
+                    accum_f32_r = vmlaq_n_f32(accum_f32_r, data.val[0], kernel[k]);
                     // g
-                    accum_f32_g = vaddq_f32(accum_f32_g, vmulq_f32(data.val[1], w));
+                    accum_f32_g = vmlaq_n_f32(accum_f32_g, data.val[1], kernel[k]);
                     // b
-                    accum_f32_b = vaddq_f32(accum_f32_b, vmulq_f32(data.val[2], w));
+                    accum_f32_b = vmlaq_n_f32(accum_f32_b, data.val[2], kernel[k]);
                 }
 
                 float32x4x3_t res;
@@ -550,8 +696,21 @@ static void verticalFilterNeonF32(float* src, float* dst, int height, int width,
                 res.val[1] = accum_f32_g;
                 res.val[2] = accum_f32_b;
 
-                vst3q_f32(dst, res);
-                dst += 12;
+                vst3q_f32(p_dst + j, res);
+                count += XA_F32_SIZE * channel;
+            }
+
+            for(int j = count / channel; j < width; j++){
+                float s[3] = {0};
+                for(int k = 0; k < ksize; k++){
+                    s[0] += in[(i + k) * width * channel + j * channel + 0] * kernel[k];
+                    s[1] += in[(i + k) * width * channel + j * channel + 1] * kernel[k];
+                    s[2] += in[(i + k) * width * channel + j * channel + 2] * kernel[k];
+                }
+
+                p_dst[j * channel + 0] = s[0];
+                p_dst[j * channel + 1] = s[1];
+                p_dst[j * channel + 2] = s[2];
             }
         }
     } else{
@@ -573,20 +732,29 @@ static void horizonFilterNeonF32(float* src, float* dst, int height, int width, 
             memcpy(in + width + kCenter, src + i * width + width - kCenter, kCenter * sizeof(float));
 
             float *p_dst = dst + i * width;
+            int n = width / XA_F32_SIZE;
+            int end = n * XA_F32_SIZE * channel;
+            int count = 0;
 
-            for(int j = 0; j < width; j+=4){
+            for(int j = 0; j < end; j+=XA_F32_SIZE){
                 float32x4_t accum_f32;
                 accum_f32 = vmovq_n_f32(0);
 
                 for(int k = 0; k < ksize; k++){
                     float32x4_t data = vld1q_f32(in + j + k);
-                    float32x4_t w = vdupq_n_f32(kernel[k]);
-
-                    accum_f32 = vaddq_f32(accum_f32, vmulq_f32(data, w));
+                    accum_f32 = vmlaq_n_f32(accum_f32, data, kernel[k]);
                 }
 
-                vst1q_f32(p_dst, accum_f32);
-                p_dst += 4;
+                vst1q_f32(p_dst + j, accum_f32);
+                count += XA_F32_SIZE;
+            }
+
+            for(int j = count / channel; j < width; j++){
+                float s = 0;
+                for(int k = 0; k < ksize; k++){
+                    s += *(in + (j + k) * channel) * kernel[k];
+                }
+                p_dst[j * channel] = s;
             }
             free(in);
         }
@@ -599,8 +767,11 @@ static void horizonFilterNeonF32(float* src, float* dst, int height, int width, 
                                                                                                               sizeof(float ));
 
             float *p_dst = dst + i * width * channel;
+            int n = width / XA_F32_SIZE;
+            int end = n * (XA_F32_SIZE * channel);
+            int count = 0;
 
-            for(int j = 0; j < width * channel; j +=12){
+            for(int j = 0; j < end; j +=XA_F32_SIZE*channel){
                 float32x4_t accum_f32_r, accum_f32_g, accum_f32_b;
                 accum_f32_r = vmovq_n_f32(0);
                 accum_f32_g = vmovq_n_f32(0);
@@ -608,23 +779,29 @@ static void horizonFilterNeonF32(float* src, float* dst, int height, int width, 
 
                 for(int k = 0; k < ksize; k++){
                     float32x4x3_t data = vld3q_f32(in + j + k * channel);
-
-                    float32x4_t w = vdupq_n_f32(kernel[k]);
-
                     // r
-                    accum_f32_r = vaddq_f32(accum_f32_r, vmulq_f32(data.val[0], w));
+                    accum_f32_r = vmlaq_n_f32(accum_f32_r, data.val[0], kernel[k]);
                     // g
-                    accum_f32_g = vaddq_f32(accum_f32_g, vmulq_f32(data.val[1], w));
+                    accum_f32_g = vmlaq_n_f32(accum_f32_g, data.val[1], kernel[k]);
                     // b
-                    accum_f32_b = vaddq_f32(accum_f32_b, vmulq_f32(data.val[2], w));
+                    accum_f32_b = vmlaq_n_f32(accum_f32_b, data.val[2], kernel[k]);
                 }
 
                 float32x4x3_t res;
                 res.val[0] = accum_f32_r;
                 res.val[1] = accum_f32_g;
                 res.val[2] = accum_f32_b;
-                vst3q_f32(p_dst, res);
-                p_dst += 12;
+                vst3q_f32(p_dst + j, res);
+                count += XA_F32_SIZE * channel;
+            }
+
+            for(int j = count / 3; j < width; j++){
+                float s[3] = {0};
+                for(int k = 0; k < ksize; k++){
+                    s[0] += *(in + (j + k) * channel + 0) * kernel[k];
+                    s[1] += *(in + (j + k) * channel + 1) * kernel[k];
+                    s[2] += *(in + (j + k) * channel + 2) * kernel[k];
+                }
             }
             free(in);
         }
@@ -643,10 +820,8 @@ void gaussianFilter_float_Neon(float* src, float* dst, int height, int width, in
     float *kernel = (float *) malloc(sizeof(float ) * ksize);
     getGaussianKernel1D(kernel, ksize, sigma);
 
-    float *temp = (float*) malloc(sizeof(float) * height * width * channel);
-    verticalFilterNeonF32(src, temp, height, width, channel, kernel, ksize);
-    horizonFilterNeonF32(temp, dst, height, width, channel, kernel, ksize);
+    verticalFilterNeonF32(src, dst, height, width, channel, kernel, ksize);
+    horizonFilterNeonF32(dst, dst, height, width, channel, kernel, ksize);
 
     free(kernel);
-    free(temp);
 }
